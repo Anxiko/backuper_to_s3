@@ -1,0 +1,14 @@
+awscrt==0.20.10
+boto3==1.34.117
+boto3-stubs==1.34.117
+botocore==1.34.117
+botocore-stubs==1.34.94
+jmespath==1.0.1
+mypy-boto3-s3==1.34.105
+python-dateutil==2.9.0.post0
+s3transfer==0.10.1
+six==1.16.0
+types-awscrt==0.20.9
+types-s3transfer==0.10.1
+typing_extensions==4.12.1
+urllib3==2.2.1
