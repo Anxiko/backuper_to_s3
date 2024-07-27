@@ -2,12 +2,10 @@ import datetime
 import json
 import logging.config
 import operator
-import sys
-import traceback
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Optional, Iterable
+from typing import Optional, Iterable, Literal
 
 import boto3
 from boto3 import Session
@@ -60,7 +58,8 @@ class Config:
 	bucket: str
 	path_local_backups: str
 	backup_ttl_seconds: int
-	timestamp_format: str
+	remote_timestamp_format: str
+	local_timestamp_format: str
 
 	@classmethod
 	def from_config(cls) -> 'Config':
@@ -75,13 +74,14 @@ class TimestampedLocalBackup:
 
 	@classmethod
 	def maybe_parse(cls, cfg: Config, path: Path) -> Optional['TimestampedLocalBackup']:
-		if (timestamp := path_to_datetime(cfg, path)) is not None:
+		if (timestamp := path_to_datetime(cfg, 'local', path)) is not None:
 			return cls(timestamp=timestamp, path=path)
 		return None
 
-	@property
-	def filename(self) -> str:
-		return self.path.name
+	def to_remote_key(self, cfg: Config) -> str:
+		formatted_timestamp: str = self.timestamp.strftime(cfg.remote_timestamp_format)
+
+		return f"{cfg.backup_dir_key_prefix}{formatted_timestamp}.zip"
 
 
 def session_from_config(cfg: Config) -> boto3.session.Session:
@@ -98,7 +98,7 @@ def backups_in_s3(client: S3Client, cfg: Config) -> set[datetime.datetime]:
 
 	return set(filter(
 		partial(operator.is_not, None),
-		map(partial(path_to_datetime, cfg), stored_keys)
+		map(partial(path_to_datetime, cfg, 'remote'), stored_keys)
 	))
 
 
@@ -111,10 +111,19 @@ def backups_local(cfg: Config) -> list[TimestampedLocalBackup]:
 	))
 
 
-def path_to_datetime(cfg: Config, path: Path) -> datetime.datetime | None:
+def path_to_datetime(cfg: Config, timestamp_source: Literal['remote', 'local'], path: Path) -> datetime.datetime | None:
+	timestamp_format: str
+	match timestamp_source:
+		case 'remote':
+			timestamp_format = cfg.remote_timestamp_format
+		case 'local':
+			timestamp_format = cfg.local_timestamp_format
+		case source:
+			raise ValueError(f"Unknown timestamp source: {source}")
+
 	raw_datetime: str = path.with_suffix('').name
 	try:
-		return datetime.datetime.strptime(raw_datetime, cfg.timestamp_format)
+		return datetime.datetime.strptime(raw_datetime, timestamp_format).replace(tzinfo=datetime.UTC)
 	except ValueError:
 		return None
 
@@ -124,25 +133,31 @@ def expired(cfg: Config, current_timestamp: datetime.datetime, local_backup: Tim
 
 
 def upload_backup(cfg: Config, s3_client: S3Client, local_backup: TimestampedLocalBackup) -> None:
-	key: str = f"{cfg.backup_dir_key_prefix}{local_backup.filename}"
+	key: str = local_backup.to_remote_key(cfg)
 	logger.info(f"Uploading backup file {local_backup} to S3 bucket {cfg.bucket} under {key}")
 	s3_client.upload_file(Filename=str(local_backup.path), Bucket=cfg.bucket, Key=key)
 
 
 def main() -> None:
+	logger.info("Started")
 	cfg: Config = Config.from_config()
 	session: Session = session_from_config(cfg)
 	s3_client: S3Client = session.client('s3')
+	logger.debug("Connected")
 
 	remote_backups: set[datetime.datetime] = backups_in_s3(s3_client, cfg)
+	logger.debug(f"Found {len(remote_backups)} remote backups: {remote_backups}")
 	local_backups: list[TimestampedLocalBackup] = backups_local(cfg)
+	logger.debug(f"Found {len(local_backups)} local backups: {local_backups}")
 
-	timestamp_now: datetime.datetime = datetime.datetime.utcnow()
+	timestamp_now: datetime.datetime = datetime.datetime.now(datetime.UTC)
 
 	must_upload_backups: list[TimestampedLocalBackup] = list(filter(
 		lambda local: local.timestamp not in remote_backups and not expired(cfg, timestamp_now, local),
 		local_backups
 	))
+
+	logger.debug(f"Files to be uploaded ({len(must_upload_backups)}): {must_upload_backups}")
 
 	for must_upload_backup in must_upload_backups:
 		upload_backup(cfg, s3_client, must_upload_backup)
